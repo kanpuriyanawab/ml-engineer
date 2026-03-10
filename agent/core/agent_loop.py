@@ -163,34 +163,6 @@ async def _compact_and_notify(session: Session) -> None:
         )
 
 
-def _patch_dangling_tool_calls(session: Session) -> None:
-    """Add stub tool results for any tool_calls that lack a matching result.
-
-    After cancellation the last assistant message may contain tool_calls
-    whose results were never recorded.  LLM APIs require every tool_call
-    to have a corresponding tool-result message, so we inject placeholders.
-    """
-    items = session.context_manager.items
-    if not items:
-        return
-    last = items[-1]
-    if getattr(last, "role", None) != "assistant" or not getattr(last, "tool_calls", None):
-        return
-    answered_ids = {
-        getattr(m, "tool_call_id", None)
-        for m in items
-        if getattr(m, "role", None) == "tool"
-    }
-    for tc in last.tool_calls:
-        if tc.id not in answered_ids:
-            items.append(
-                Message(
-                    role="tool",
-                    content="Cancelled by user.",
-                    tool_call_id=tc.id,
-                    name=tc.function.name,
-                )
-            )
 
 
 class Handlers:
@@ -382,7 +354,6 @@ class Handlers:
 
                 # ── Cancellation check: before tool execution ──
                 if session.is_cancelled:
-                    _patch_dangling_tool_calls(session)
                     break
 
                 # Separate tools into those requiring approval and those that don't
@@ -566,28 +537,10 @@ class Handlers:
 
     @staticmethod
     async def undo(session: Session) -> None:
-        """Remove the last complete turn (user msg + all assistant/tool msgs that follow).
-
-        Anthropic requires every tool_use to have a matching tool_result,
-        so we can't just pop 2 items — we must pop everything back to
-        (and including) the last user message to keep the history valid.
-        """
-        items = session.context_manager.items
-        if not items:
-            await session.send_event(Event(event_type="undo_complete"))
-            return
-
-        # Pop from the end until we've removed the last user message
-        removed_user = False
-        while items:
-            msg = items.pop()
-            if getattr(msg, "role", None) == "user":
-                removed_user = True
-                break
-
-        if not removed_user:
+        """Remove the last complete turn and notify the frontend."""
+        removed = session.context_manager.undo_last_turn()
+        if not removed:
             logger.warning("Undo: no user message found to remove")
-
         await session.send_event(Event(event_type="undo_complete"))
 
     @staticmethod

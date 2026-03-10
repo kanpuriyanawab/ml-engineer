@@ -131,8 +131,56 @@ class ContextManager:
         self.items.append(message)
 
     def get_messages(self) -> list[Message]:
-        """Get all messages for sending to LLM"""
+        """Get all messages for sending to LLM.
+
+        Automatically patches any dangling tool_calls (assistant messages
+        with tool_calls that have no matching tool-result message).  This
+        can happen after errors or cancellations and would cause the LLM
+        API to reject the request.
+        """
+        self._patch_dangling_tool_calls()
         return self.items
+
+    def _patch_dangling_tool_calls(self) -> None:
+        """Add stub tool results for any tool_calls that lack a matching result."""
+        if not self.items:
+            return
+        last = self.items[-1]
+        if getattr(last, "role", None) != "assistant" or not getattr(last, "tool_calls", None):
+            return
+        answered_ids = {
+            getattr(m, "tool_call_id", None)
+            for m in self.items
+            if getattr(m, "role", None) == "tool"
+        }
+        for tc in last.tool_calls:
+            if tc.id not in answered_ids:
+                self.items.append(
+                    Message(
+                        role="tool",
+                        content="Tool was not executed (interrupted or error).",
+                        tool_call_id=tc.id,
+                        name=tc.function.name,
+                    )
+                )
+
+    def undo_last_turn(self) -> bool:
+        """Remove the last complete turn (user msg + all assistant/tool msgs that follow).
+
+        Pops from the end until the last user message is removed, keeping the
+        tool_use/tool_result pairing valid.
+
+        Returns True if a user message was found and removed.
+        """
+        if not self.items:
+            return False
+
+        while self.items:
+            msg = self.items.pop()
+            if getattr(msg, "role", None) == "user":
+                return True
+
+        return False
 
     async def compact(
         self, model_name: str, tool_specs: list[dict] | None = None
