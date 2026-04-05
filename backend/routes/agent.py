@@ -7,6 +7,7 @@ dependency. In dev mode (no OAUTH_CLIENT_ID), auth is bypassed automatically.
 import asyncio
 import json
 import logging
+import os
 from typing import Any
 
 from dependencies import get_current_user
@@ -205,17 +206,14 @@ async def create_session(
 
     Returns 503 if the server or user has reached the session limit.
     """
-    # Extract the user's HF token (Bearer header or HttpOnly cookie)
-    # In dev mode, fall back to environment variable if no token in request
+    # Extract the user's HF token (Bearer header, HttpOnly cookie, or env var)
     hf_token = None
     auth_header = request.headers.get("Authorization", "")
     if auth_header.startswith("Bearer "):
         hf_token = auth_header[7:]
     if not hf_token:
         hf_token = request.cookies.get("hf_access_token")
-    if not hf_token and user["user_id"] == "dev":
-        # Dev mode: use HF_TOKEN from environment
-        import os
+    if not hf_token:
         hf_token = os.environ.get("HF_TOKEN")
 
     try:
