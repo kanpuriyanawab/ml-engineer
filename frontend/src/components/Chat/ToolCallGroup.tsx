@@ -10,6 +10,7 @@ import BlockIcon from '@mui/icons-material/Block';
 import { useAgentStore } from '@/store/agentStore';
 import { useLayoutStore } from '@/store/layoutStore';
 import { logger } from '@/utils/logger';
+import { RESEARCH_MAX_STEPS } from '@/lib/research-store';
 import type { UIMessage } from 'ai';
 
 // ---------------------------------------------------------------------------
@@ -163,7 +164,7 @@ function formatResearchStep(raw: string): { label: string } {
 /** Rolling 2-line display of research sub-tool calls — hidden when complete. */
 function ResearchSteps({ steps, isRunning }: { steps: string[]; isRunning: boolean }) {
   if (!isRunning) return null;
-  const visible = steps.slice(-4);
+  const visible = steps.slice(-RESEARCH_MAX_STEPS);
   if (visible.length === 0) return null;
 
   return (

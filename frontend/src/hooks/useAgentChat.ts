@@ -12,6 +12,7 @@ import { useChat } from '@ai-sdk/react';
 import { type UIMessage, lastAssistantMessageIsCompleteWithApprovalResponses } from 'ai';
 import { SSEChatTransport, type SideChannelCallbacks } from '@/lib/sse-chat-transport';
 import { loadMessages, saveMessages } from '@/lib/chat-message-store';
+import { saveResearch, loadResearch, clearResearch, RESEARCH_MAX_STEPS } from '@/lib/research-store';
 import { llmMessagesToUIMessages } from '@/lib/convert-llm-messages';
 import { apiFetch } from '@/utils/api';
 import { useAgentStore } from '@/store/agentStore';
@@ -92,32 +93,39 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
           const stats = { ...sessState.researchStats };
 
           if (log === 'Starting research sub-agent...') {
+            const newStats = { toolCount: 0, tokenCount: 0, startedAt: Date.now(), finalElapsed: null };
             updateSession(sessionId, {
               researchSteps: [],
-              researchStats: { toolCount: 0, tokenCount: 0, startedAt: Date.now(), finalElapsed: null },
+              researchStats: newStats,
               activityStatus: { type: 'tool', toolName: 'research', description: log },
             });
+            saveResearch(sessionId, [], newStats);
           } else if (log.startsWith('tokens:')) {
             stats.tokenCount = parseInt(log.slice(7), 10);
             updateSession(sessionId, { researchStats: stats });
+            saveResearch(sessionId, sessState.researchSteps, stats);
           } else if (log.startsWith('tools:')) {
             stats.toolCount = parseInt(log.slice(6), 10);
             updateSession(sessionId, { researchStats: stats });
+            saveResearch(sessionId, sessState.researchSteps, stats);
           } else if (log === 'Research complete.') {
             const elapsed = stats.startedAt
               ? Math.round((Date.now() - stats.startedAt) / 1000)
               : null;
+            const doneStats = { ...stats, startedAt: null, finalElapsed: elapsed };
             updateSession(sessionId, {
-              researchStats: { ...stats, startedAt: null, finalElapsed: elapsed },
+              researchStats: doneStats,
               activityStatus: { type: 'tool', toolName: 'research', description: log },
             });
+            clearResearch(sessionId);
           } else {
-            // Regular tool call step — append
-            const steps = [...sessState.researchSteps, log];
+            // Regular tool call step — append (trim to max)
+            const steps = [...sessState.researchSteps, log].slice(-RESEARCH_MAX_STEPS);
             updateSession(sessionId, {
               researchSteps: steps,
               activityStatus: { type: 'tool', toolName: 'research', description: log },
             });
+            saveResearch(sessionId, steps, stats);
           }
           return;
         }
@@ -372,9 +380,25 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
         // results make tools look "done" even when the agent is still
         // mid-turn and about to call more tools.
         if (backendIsProcessing) {
-          updateSession(sessionId, { isProcessing: true, activityStatus: { type: 'thinking' } });
+          // Restore research sub-agent state alongside isProcessing in one
+          // atomic update so the UI never sees isProcessing=false with stale
+          // tool states (which would coerce them to 'output-available').
+          const savedResearch = loadResearch(sessionId);
+          updateSession(sessionId, {
+            isProcessing: true,
+            activityStatus: savedResearch?.stats.startedAt
+              ? { type: 'tool', toolName: 'research', description: 'Resuming research...' }
+              : { type: 'thinking' },
+            ...(savedResearch && {
+              researchSteps: savedResearch.steps,
+              researchStats: savedResearch.stats,
+            }),
+          });
         } else if (pendingIds && pendingIds.size > 0) {
           updateSession(sessionId, { activityStatus: { type: 'waiting-approval' } });
+          clearResearch(sessionId);
+        } else {
+          clearResearch(sessionId);
         }
       } catch {
         /* backend unreachable -- localStorage fallback is fine */
