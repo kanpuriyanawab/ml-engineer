@@ -1,0 +1,108 @@
+name: mlx-lora-mac
+framework: mlx-lm
+runtime: local
+description: >
+  LoRA fine-tuning on Mac with MLX. Runs natively on Apple Silicon via Metal —
+  no CUDA required. Fast iteration at zero cloud cost. Best for models up to 3B.
+  Uses mlx-community/ quantized variants for memory efficiency.
+recommended_model_size_range: "up to 3B"
+dependencies:
+  - mlx-lm
+  - datasets
+  - huggingface_hub
+params:
+  required:
+    - name: model_id
+      description: "mlx-community/ model (e.g. mlx-community/Qwen2.5-1.5B-Instruct-4bit)"
+    - name: dataset_id
+      description: "HuggingFace dataset ID"
+    - name: adapter_path
+      description: "Local path to save LoRA adapters (e.g. ./adapters)"
+    - name: text_column
+      description: "Dataset column name containing training text (e.g. 'text', 'messages')"
+  optional:
+    - name: iters
+      default: "1000"
+      description: "Number of training iterations"
+    - name: learning_rate
+      default: "1e-5"
+      description: "Learning rate"
+    - name: batch_size
+      default: "4"
+      description: "Batch size per device"
+    - name: lora_layers
+      default: "16"
+      description: "Number of layers to apply LoRA to"
+    - name: max_seq_length
+      default: "2048"
+      description: "Maximum sequence length"
+    - name: output_repo
+      default: ""
+      description: "HF repo to push adapters to after training (optional)"
+script: |
+  import json
+  import os
+  from datasets import load_dataset
+  from huggingface_hub import login
+
+  # ── Params injected by the agent ─────────────────────────────────────────
+  MODEL_ID = "{{model_id}}"
+  DATASET_ID = "{{dataset_id}}"
+  ADAPTER_PATH = "{{adapter_path}}"
+  TEXT_COLUMN = "{{text_column}}"
+  ITERS = int("{{iters}}")
+  LEARNING_RATE = float("{{learning_rate}}")
+  BATCH_SIZE = int("{{batch_size}}")
+  LORA_LAYERS = int("{{lora_layers}}")
+  MAX_SEQ_LENGTH = int("{{max_seq_length}}")
+  OUTPUT_REPO = "{{output_repo}}"
+
+  hf_token = os.environ.get("HF_TOKEN", "")
+  if hf_token:
+      login(token=hf_token)
+
+  # ── Load and format dataset ───────────────────────────────────────────────
+  print(f"Loading dataset: {DATASET_ID}")
+  dataset = load_dataset(DATASET_ID, split="train")
+
+  # Write to JSONL format required by mlx_lm
+  data_path = "/tmp/mlx_train_data.jsonl"
+  with open(data_path, "w") as f:
+      for row in dataset:
+          text = row[TEXT_COLUMN] if TEXT_COLUMN in row else str(row)
+          json.dump({"text": text}, f)
+          f.write("\n")
+
+  print(f"Wrote {len(dataset)} examples to {data_path}")
+
+  # ── Run LoRA training ─────────────────────────────────────────────────────
+  import mlx_lm
+
+  print(f"Starting LoRA training: {MODEL_ID}")
+  print(f"iters={ITERS}, lr={LEARNING_RATE}, batch_size={BATCH_SIZE}")
+
+  mlx_lm.lora.train(
+      model=MODEL_ID,
+      train=True,
+      data=data_path,
+      adapter_path=ADAPTER_PATH,
+      iters=ITERS,
+      learning_rate=LEARNING_RATE,
+      batch_size=BATCH_SIZE,
+      lora_layers=LORA_LAYERS,
+      max_seq_length=MAX_SEQ_LENGTH,
+      steps_per_report=10,
+  )
+
+  print(f"Training complete. Adapters saved to: {ADAPTER_PATH}")
+
+  # ── Optionally push to Hub ────────────────────────────────────────────────
+  if OUTPUT_REPO:
+      from huggingface_hub import HfApi
+      api = HfApi()
+      api.upload_folder(
+          folder_path=ADAPTER_PATH,
+          repo_id=OUTPUT_REPO,
+          repo_type="model",
+      )
+      print(f"Adapters pushed to: https://huggingface.co/{OUTPUT_REPO}")

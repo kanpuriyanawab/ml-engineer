@@ -120,6 +120,9 @@ def _needs_approval(
     if tool_name == "local_finetune":
         return tool_args.get("operation") == "run"
 
+    if tool_name == "modal_finetune":
+        return tool_args.get("operation") == "run"
+
     if tool_name == "hf_jobs":
         operation = tool_args.get("operation", "")
         if operation not in ["run", "uv", "scheduled run", "scheduled uv"]:
@@ -272,6 +275,31 @@ async def _cleanup_on_cancel(session: Session) -> None:
             except Exception as e:
                 logger.warning("Failed to cancel HF job %s: %s", job_id, e)
         session._running_job_ids.clear()
+
+    # Cancel running Modal apps
+    modal_app_ids = list(getattr(session, "_modal_app_ids", set()))
+    if modal_app_ids:
+        import os as _os
+        modal_env = {
+            **_os.environ,
+            **{k: v for k, v in [
+                ("MODAL_TOKEN_ID", _os.environ.get("MODAL_TOKEN_ID", "")),
+                ("MODAL_TOKEN_SECRET", _os.environ.get("MODAL_TOKEN_SECRET", "")),
+            ] if v},
+        }
+        for app_id in modal_app_ids:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "modal", "app", "stop", app_id,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                    env=modal_env,
+                )
+                await proc.wait()
+                logger.info("Cancelled Modal app %s on interrupt", app_id)
+            except Exception as e:
+                logger.warning("Failed to cancel Modal app %s: %s", app_id, e)
+        session._modal_app_ids.clear()
 
 
 @dataclass

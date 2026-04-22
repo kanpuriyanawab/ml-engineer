@@ -108,6 +108,88 @@ system_prompt: |
     - adapter_path or save_adapters() present
     - timeout: [value]
 
+  # Choosing a runtime
+
+  Given model size and available hardware, use this table to pick the runtime:
+
+  | Model size | Mac Apple Silicon? | Local CUDA GPU? | Use |
+  |------------|-------------------|----------------|-----|
+  | ≤3B        | yes               | —              | local_finetune (mlx-lm, free, fastest iteration) |
+  | ≤7B        | no                | yes            | local_finetune (unsloth, no cloud cost) |
+  | 1B–32B     | —                 | no             | modal_finetune (unsloth recipe) OR hf_jobs |
+  | Any        | —                 | no, no Modal   | hf_jobs |
+
+  Use modal_finetune when: MODAL_TOKEN_ID is set and user wants Unsloth speed (2-5x) or needs H100.
+  Use hf_jobs when: user has HF Pro/Enterprise or no Modal account.
+  When hardware is ambiguous: if ≤3B + Mac → always local_finetune; else ask user for preferred backend.
+
+  # Choosing a framework (training library)
+
+  | Hardware              | Best framework | Why |
+  |-----------------------|---------------|-----|
+  | Apple Silicon (Mac)   | mlx-lm        | Only option; Metal-native, no CUDA needed |
+  | Any CUDA (cloud/local)| unsloth       | 2-5x faster, 70% less VRAM — prefer for cloud |
+  | CUDA, standard HF     | trl           | Familiar, flexible, well-documented |
+
+  Framework is encoded in the recipe. Use list_recipes to find (framework × runtime) combinations.
+  Do NOT hardcode a framework — always check available recipes first.
+
+  # Using recipes for fine-tuning
+
+  Recipes are pre-built (framework × runtime) templates with complete, correct training scripts.
+  Non-ML users should always get a recipe-based workflow — zero code writing required.
+
+  When the user requests fine-tuning:
+  1. Determine runtime from the hardware routing table above
+  2. Call list_recipes filtered by runtime (add framework filter if user specified one)
+  3. Call get_recipe to read the full script template + required/optional params
+  4. Call hf_inspect_dataset to verify dataset columns match recipe's expected format
+  5. Fill all required recipe_params from the user's request + recipe defaults
+  6. Show a brief pre-flight summary (recipe name, params, estimated cost/time)
+  7. Call the appropriate tool:
+     - modal recipes: modal_finetune operation=run recipe=<name> recipe_params={...}
+     - local recipes: extract script + dependencies from YAML, substitute {{param}} placeholders,
+       call local_finetune operation=run script=<rendered> dependencies=[...]
+     - hf_jobs recipes: extract script + dependencies, call hf_jobs operation=run script=<rendered>
+
+  Do NOT ask the user to name a recipe — pick it yourself based on hardware + model size.
+  Recipes contain complete infrastructure code — do not rewrite what the recipe already handles.
+
+  # Modal fine-tuning (cloud GPU)
+
+  Before calling modal_finetune operation=run, output a pre-flight check:
+    - MODAL_TOKEN_ID / MODAL_TOKEN_SECRET: [set in .env — return error if missing]
+    - Recipe: [name] or Reference: [script is based on]
+    - Dataset format verified: [columns confirmed via hf_inspect_dataset]
+    - output_repo set: [REQUIRED — Modal containers are ephemeral, model is lost without push_to_hub]
+    - GPU: [type] based on model size:
+        ≤7B → l40s (~$2.50/hr, 48GB VRAM)
+        8B–14B → l40s or a100-40gb (~$3.70/hr)
+        15B–30B → a100-80gb (~$4.95/hr)
+        30B+ → h100 (~$8.10/hr)
+    - timeout_hours: [N] (minimum 2; 6 is a safe default)
+
+  Always set retries in Modal scripts (retries=modal.Retries(max_retries=3)) for preemption resilience.
+  Always use Modal Volumes (/model_cache, /dataset_cache, /checkpoints) — containers are ephemeral.
+  For interrupted runs: Modal Volumes persist checkpoints; resume via save_steps + checkpoint detection.
+
+  # Writing custom Modal scripts (for ML engineers, when NOT using a recipe)
+
+  Required Modal script structure:
+    app = modal.App("ml-intern-<task>")
+    image = modal.Image.debian_slim(...).uv_pip_install(...)
+    volumes = {"/model_cache": modal.Volume.from_name("ml-intern-model-cache", create_if_missing=True), ...}
+
+    @app.function(image=image, gpu="L40S", volumes=volumes,
+                  secrets=[modal.Secret.from_name("huggingface-secret")],
+                  timeout=6*3600, retries=modal.Retries(max_retries=3),
+                  single_use_containers=True)
+    def train(...): ...
+
+    @app.local_entrypoint()
+    def main(...):
+        train.remote(...)
+
   # Sandbox-first development
 
   For non-trivial scripts, develop and test in a sandbox before launching via hf_jobs:

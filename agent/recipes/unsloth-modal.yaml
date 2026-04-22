@@ -1,0 +1,230 @@
+name: unsloth-modal
+framework: unsloth
+runtime: modal
+description: >
+  SFT fine-tuning with Unsloth on Modal cloud GPU. 2-5x faster than standard
+  Transformers training, 70% less VRAM. Includes Modal Volume caching for model
+  weights and datasets across runs. Best for 1B-32B instruction/chat models.
+  Requires MODAL_TOKEN_ID and MODAL_TOKEN_SECRET in .env.
+gpu: l40s
+timeout_hours: 6
+estimated_cost_per_hour: 2.50
+recommended_model_size_range: "1B–32B"
+dependencies:
+  - "accelerate==1.9.0"
+  - "datasets==3.6.0"
+  - "hf-transfer==0.1.9"
+  - "huggingface_hub==0.34.2"
+  - "peft==0.16.0"
+  - "transformers==4.54.0"
+  - "trl==0.19.1"
+  - "unsloth[cu128-torch270]==2025.7.8"
+  - "unsloth_zoo==2025.7.10"
+params:
+  required:
+    - name: model_id
+      description: "HF model ID (e.g. unsloth/Qwen3-14B or unsloth/Qwen2.5-1.5B-Instruct)"
+    - name: dataset_id
+      description: "HF dataset ID"
+    - name: output_repo
+      description: "HF repo to push trained model to (e.g. yourname/qwen-finetuned)"
+  optional:
+    - name: max_steps
+      default: "500"
+      description: "Training steps (increase to 2000+ for full runs)"
+    - name: lora_r
+      default: "16"
+      description: "LoRA rank (higher = more capacity, more VRAM)"
+    - name: batch_size
+      default: "16"
+      description: "Per-device batch size"
+    - name: learning_rate
+      default: "2e-4"
+      description: "Learning rate"
+    - name: max_seq_length
+      default: "32768"
+      description: "Maximum sequence length"
+    - name: dataset_split
+      default: "train"
+      description: "Dataset split to train on"
+script: |
+  import pathlib
+  from datetime import datetime
+  from typing import Optional
+  import modal
+
+  # ── Modal infrastructure ──────────────────────────────────────────────────
+  app = modal.App("ml-intern-unsloth-finetune")
+
+  train_image = (
+      modal.Image.debian_slim(python_version="3.11")
+      .uv_pip_install(
+          "accelerate==1.9.0",
+          "datasets==3.6.0",
+          "hf-transfer==0.1.9",
+          "huggingface_hub==0.34.2",
+          "peft==0.16.0",
+          "transformers==4.54.0",
+          "trl==0.19.1",
+          "unsloth[cu128-torch270]==2025.7.8",
+          "unsloth_zoo==2025.7.10",
+      )
+      .env({"HF_HOME": "/model_cache", "HF_HUB_ENABLE_HF_TRANSFER": "1"})
+  )
+
+  with train_image.imports():
+      import unsloth  # noqa: F401,I001
+      import datasets as ds
+      from transformers import TrainingArguments
+      from trl import SFTTrainer, SFTConfig
+      from unsloth import FastLanguageModel
+      from unsloth.chat_templates import standardize_sharegpt
+
+  model_cache_volume = modal.Volume.from_name("ml-intern-model-cache", create_if_missing=True)
+  dataset_cache_volume = modal.Volume.from_name("ml-intern-dataset-cache", create_if_missing=True)
+  checkpoint_volume = modal.Volume.from_name("ml-intern-checkpoints", create_if_missing=True)
+
+  LORA_TARGET_MODULES = [
+      "q_proj", "k_proj", "v_proj", "o_proj",
+      "gate_proj", "up_proj", "down_proj",
+  ]
+
+  @app.function(
+      image=train_image,
+      gpu="{{gpu}}",
+      volumes={
+          "/model_cache": model_cache_volume,
+          "/dataset_cache": dataset_cache_volume,
+          "/checkpoints": checkpoint_volume,
+      },
+      secrets=[modal.Secret.from_name("huggingface-secret")],
+      timeout={{timeout_hours}} * 60 * 60,
+      retries=modal.Retries(initial_delay=0.0, max_retries=3),
+      single_use_containers=True,
+  )
+  def finetune(
+      model_id: str,
+      dataset_id: str,
+      output_repo: str,
+      max_steps: int = 500,
+      lora_r: int = 16,
+      batch_size: int = 16,
+      learning_rate: float = 2e-4,
+      max_seq_length: int = 32768,
+      dataset_split: str = "train",
+  ):
+      import os
+      from huggingface_hub import login
+
+      hf_token = os.environ.get("HF_TOKEN", "")
+      if hf_token:
+          login(token=hf_token)
+
+      timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+      experiment_name = f"{model_id.split('/')[-1]}-r{lora_r}-{timestamp}"
+      checkpoint_path = pathlib.Path("/checkpoints") / experiment_name
+
+      # ── Load model ───────────────────────────────────────────────────────
+      print(f"Loading model: {model_id}")
+      model, tokenizer = FastLanguageModel.from_pretrained(
+          model_name=model_id,
+          max_seq_length=max_seq_length,
+          dtype=None,
+          load_in_4bit=True,
+      )
+
+      # ── Apply LoRA ───────────────────────────────────────────────────────
+      model = FastLanguageModel.get_peft_model(
+          model,
+          r=lora_r,
+          target_modules=LORA_TARGET_MODULES,
+          lora_alpha=lora_r,
+          lora_dropout=0.0,
+          bias="none",
+          use_gradient_checkpointing="unsloth",
+          random_state=42,
+          use_rslora=False,
+      )
+
+      # ── Load and cache dataset ────────────────────────────────────────────
+      dataset_cache_path = (
+          pathlib.Path("/dataset_cache") / dataset_id.replace("/", "--") / dataset_split
+      )
+      if dataset_cache_path.exists():
+          print(f"Loading cached dataset from {dataset_cache_path}")
+          train_dataset = ds.load_from_disk(str(dataset_cache_path))
+      else:
+          print(f"Downloading dataset: {dataset_id}")
+          raw = ds.load_dataset(dataset_id, split=dataset_split)
+          # Standardize ShareGPT format if applicable
+          try:
+              raw = standardize_sharegpt(raw)
+              raw = raw.map(
+                  lambda x: {"text": tokenizer.apply_chat_template(
+                      x["conversations"], tokenize=False, add_generation_prompt=False
+                  )},
+                  batched=True,
+                  remove_columns=raw.column_names,
+              )
+          except Exception:
+              pass  # dataset may already be in text format
+          train_dataset = raw
+          dataset_cache_path.parent.mkdir(parents=True, exist_ok=True)
+          train_dataset.save_to_disk(str(dataset_cache_path))
+          dataset_cache_volume.commit()
+
+      # ── Train ─────────────────────────────────────────────────────────────
+      checkpoint_path.mkdir(parents=True, exist_ok=True)
+
+      trainer = SFTTrainer(
+          model=model,
+          tokenizer=tokenizer,
+          train_dataset=train_dataset,
+          args=SFTConfig(
+              per_device_train_batch_size=batch_size,
+              gradient_accumulation_steps=4,
+              max_steps=max_steps,
+              learning_rate=learning_rate,
+              warmup_ratio=0.06,
+              weight_decay=0.01,
+              lr_scheduler_type="cosine",
+              fp16=False,
+              bf16=True,
+              optim="adamw_8bit",
+              logging_steps=10,
+              logging_first_step=True,
+              disable_tqdm=True,
+              output_dir=str(checkpoint_path),
+              save_steps=max(max_steps // 5, 1),
+              push_to_hub=True,
+              hub_model_id=output_repo,
+              hub_strategy="end",
+          ),
+      )
+
+      print(f"Training: {model_id} for {max_steps} steps")
+      print(f"Dataset: {len(train_dataset)} examples | LoRA rank: {lora_r}")
+      trainer.train()
+      trainer.push_to_hub()
+      checkpoint_volume.commit()
+
+      print(f"Done! Model pushed to: https://huggingface.co/{output_repo}")
+      return experiment_name
+
+  @app.local_entrypoint()
+  def main(
+      model_id: str = "{{model_id}}",
+      dataset_id: str = "{{dataset_id}}",
+      output_repo: str = "{{output_repo}}",
+      max_steps: int = {{max_steps}},
+      lora_r: int = {{lora_r}},
+      batch_size: int = {{batch_size}},
+      learning_rate: float = {{learning_rate}},
+      max_seq_length: int = {{max_seq_length}},
+      dataset_split: str = "{{dataset_split}}",
+  ):
+      name = finetune.remote(
+          model_id, dataset_id, output_repo,
+          max_steps, lora_r, batch_size, learning_rate, max_seq_length, dataset_split,
+      )
+      print(f"Training completed: {name}")

@@ -1,0 +1,190 @@
+name: trl-modal
+framework: trl
+runtime: modal
+description: >
+  SFT fine-tuning with TRL SFTTrainer on Modal cloud GPU. Standard HuggingFace
+  ecosystem — familiar APIs, well-documented. Good choice when you don't need
+  Unsloth's speed and prefer the standard HF stack. Works for any model size.
+  Requires MODAL_TOKEN_ID and MODAL_TOKEN_SECRET in .env.
+gpu: a100-40gb
+timeout_hours: 8
+estimated_cost_per_hour: 3.70
+recommended_model_size_range: "1B–30B"
+dependencies:
+  - "transformers>=4.45.0"
+  - "trl>=0.12.0"
+  - "peft>=0.13.0"
+  - "accelerate>=1.0.0"
+  - "datasets>=3.0.0"
+  - "hf-transfer>=0.1.8"
+  - "huggingface_hub>=0.26.0"
+  - "bitsandbytes>=0.44.0"
+params:
+  required:
+    - name: model_id
+      description: "HF model ID (e.g. meta-llama/Llama-3.2-3B-Instruct)"
+    - name: dataset_id
+      description: "HF dataset ID"
+    - name: output_repo
+      description: "HF repo to push trained model to"
+  optional:
+    - name: max_steps
+      default: "500"
+    - name: lora_r
+      default: "16"
+    - name: batch_size
+      default: "4"
+    - name: learning_rate
+      default: "2e-4"
+    - name: max_seq_length
+      default: "2048"
+    - name: dataset_split
+      default: "train"
+    - name: text_column
+      default: "text"
+      description: "Dataset column with training text"
+script: |
+  import modal
+
+  # ── Modal infrastructure ──────────────────────────────────────────────────
+  app = modal.App("ml-intern-trl-finetune")
+
+  train_image = (
+      modal.Image.debian_slim(python_version="3.11")
+      .uv_pip_install(
+          "transformers>=4.45.0",
+          "trl>=0.12.0",
+          "peft>=0.13.0",
+          "accelerate>=1.0.0",
+          "datasets>=3.0.0",
+          "hf-transfer>=0.1.8",
+          "huggingface_hub>=0.26.0",
+          "bitsandbytes>=0.44.0",
+      )
+      .env({"HF_HOME": "/model_cache", "HF_HUB_ENABLE_HF_TRANSFER": "1"})
+  )
+
+  with train_image.imports():
+      import datasets as ds
+      import torch
+      from peft import LoraConfig, TaskType
+      from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+      from trl import SFTTrainer, SFTConfig
+
+  model_cache_volume = modal.Volume.from_name("ml-intern-model-cache", create_if_missing=True)
+  dataset_cache_volume = modal.Volume.from_name("ml-intern-dataset-cache", create_if_missing=True)
+  checkpoint_volume = modal.Volume.from_name("ml-intern-checkpoints", create_if_missing=True)
+
+  @app.function(
+      image=train_image,
+      gpu="{{gpu}}",
+      volumes={
+          "/model_cache": model_cache_volume,
+          "/dataset_cache": dataset_cache_volume,
+          "/checkpoints": checkpoint_volume,
+      },
+      secrets=[modal.Secret.from_name("huggingface-secret")],
+      timeout={{timeout_hours}} * 60 * 60,
+      retries=modal.Retries(initial_delay=0.0, max_retries=3),
+      single_use_containers=True,
+  )
+  def finetune(
+      model_id: str,
+      dataset_id: str,
+      output_repo: str,
+      max_steps: int = 500,
+      lora_r: int = 16,
+      batch_size: int = 4,
+      learning_rate: float = 2e-4,
+      max_seq_length: int = 2048,
+      dataset_split: str = "train",
+      text_column: str = "text",
+  ):
+      import os
+      from huggingface_hub import login
+
+      hf_token = os.environ.get("HF_TOKEN", "")
+      if hf_token:
+          login(token=hf_token)
+
+      print(f"Loading model: {model_id}")
+      bnb_config = BitsAndBytesConfig(
+          load_in_4bit=True,
+          bnb_4bit_quant_type="nf4",
+          bnb_4bit_compute_dtype=torch.bfloat16,
+          bnb_4bit_use_double_quant=True,
+      )
+      model = AutoModelForCausalLM.from_pretrained(
+          model_id,
+          quantization_config=bnb_config,
+          device_map="auto",
+          cache_dir="/model_cache",
+      )
+      tokenizer = AutoTokenizer.from_pretrained(model_id, cache_dir="/model_cache")
+      if tokenizer.pad_token is None:
+          tokenizer.pad_token = tokenizer.eos_token
+
+      peft_config = LoraConfig(
+          task_type=TaskType.CAUSAL_LM,
+          r=lora_r,
+          lora_alpha=lora_r * 2,
+          lora_dropout=0.05,
+          target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                          "gate_proj", "up_proj", "down_proj"],
+      )
+
+      print(f"Loading dataset: {dataset_id}")
+      dataset = ds.load_dataset(dataset_id, split=dataset_split, cache_dir="/dataset_cache")
+      dataset_cache_volume.commit()
+
+      trainer = SFTTrainer(
+          model=model,
+          tokenizer=tokenizer,
+          train_dataset=dataset,
+          peft_config=peft_config,
+          args=SFTConfig(
+              dataset_text_field=text_column,
+              max_seq_length=max_seq_length,
+              per_device_train_batch_size=batch_size,
+              gradient_accumulation_steps=4,
+              max_steps=max_steps,
+              learning_rate=learning_rate,
+              warmup_ratio=0.06,
+              weight_decay=0.01,
+              lr_scheduler_type="cosine",
+              bf16=True,
+              logging_steps=10,
+              logging_first_step=True,
+              disable_tqdm=True,
+              output_dir="/checkpoints/trl-run",
+              save_steps=max(max_steps // 5, 1),
+              push_to_hub=True,
+              hub_model_id=output_repo,
+              hub_strategy="end",
+          ),
+      )
+
+      print(f"Training {model_id} for {max_steps} steps on {len(dataset)} examples")
+      trainer.train()
+      trainer.push_to_hub()
+      checkpoint_volume.commit()
+      print(f"Done! Model pushed to: https://huggingface.co/{output_repo}")
+
+  @app.local_entrypoint()
+  def main(
+      model_id: str = "{{model_id}}",
+      dataset_id: str = "{{dataset_id}}",
+      output_repo: str = "{{output_repo}}",
+      max_steps: int = {{max_steps}},
+      lora_r: int = {{lora_r}},
+      batch_size: int = {{batch_size}},
+      learning_rate: float = {{learning_rate}},
+      max_seq_length: int = {{max_seq_length}},
+      dataset_split: str = "{{dataset_split}}",
+      text_column: str = "{{text_column}}",
+  ):
+      finetune.remote(
+          model_id, dataset_id, output_repo,
+          max_steps, lora_r, batch_size, learning_rate,
+          max_seq_length, dataset_split, text_column,
+      )

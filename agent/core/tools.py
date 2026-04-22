@@ -47,6 +47,13 @@ from agent.tools.hf_repo_git_tool import (
 )
 from agent.tools.jobs_tool import HF_JOBS_TOOL_SPEC, hf_jobs_handler
 from agent.tools.local_finetune_tool import LOCAL_FINETUNE_TOOL_SPEC, local_finetune_handler
+from agent.tools.modal_finetune_tool import MODAL_FINETUNE_TOOL_SPEC, modal_finetune_handler
+from agent.tools.recipes_tool import (
+    GET_RECIPE_TOOL_SPEC,
+    LIST_RECIPES_TOOL_SPEC,
+    get_recipe_handler,
+    list_recipes_handler,
+)
 from agent.tools.papers_tool import HF_PAPERS_TOOL_SPEC, hf_papers_handler
 from agent.tools.plan_tool import PLAN_TOOL_SPEC, plan_tool_handler
 from agent.tools.research_tool import RESEARCH_TOOL_SPEC, research_handler
@@ -336,6 +343,24 @@ def create_builtin_tools(local_mode: bool = False) -> list[ToolSpec]:
             description=LOCAL_FINETUNE_TOOL_SPEC["description"],
             parameters=LOCAL_FINETUNE_TOOL_SPEC["parameters"],
             handler=local_finetune_handler,
+        ),
+        ToolSpec(
+            name=MODAL_FINETUNE_TOOL_SPEC["name"],
+            description=MODAL_FINETUNE_TOOL_SPEC["description"],
+            parameters=MODAL_FINETUNE_TOOL_SPEC["parameters"],
+            handler=modal_finetune_handler,
+        ),
+        ToolSpec(
+            name=LIST_RECIPES_TOOL_SPEC["name"],
+            description=LIST_RECIPES_TOOL_SPEC["description"],
+            parameters=LIST_RECIPES_TOOL_SPEC["parameters"],
+            handler=list_recipes_handler,
+        ),
+        ToolSpec(
+            name=GET_RECIPE_TOOL_SPEC["name"],
+            description=GET_RECIPE_TOOL_SPEC["description"],
+            parameters=GET_RECIPE_TOOL_SPEC["parameters"],
+            handler=get_recipe_handler,
         ),
         # HF Repo management tools
         ToolSpec(

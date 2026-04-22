@@ -1,0 +1,128 @@
+name: trl-hf-jobs
+framework: trl
+runtime: hf_jobs
+description: >
+  SFT fine-tuning with TRL SFTTrainer on HuggingFace Jobs cloud GPU.
+  Standard HF ecosystem, no Modal account needed. Good for 1B-30B models.
+  Requires HF Pro or Enterprise account with GPU compute access.
+hardware_flavor: a10g-large
+estimated_cost_per_hour: 1.50
+recommended_model_size_range: "1B–30B"
+dependencies:
+  - "transformers>=4.45.0"
+  - "trl>=0.12.0"
+  - "peft>=0.13.0"
+  - "accelerate>=1.0.0"
+  - "datasets>=3.0.0"
+  - "hf-transfer>=0.1.8"
+  - "bitsandbytes>=0.44.0"
+params:
+  required:
+    - name: model_id
+      description: "HF model ID (e.g. meta-llama/Llama-3.2-3B-Instruct)"
+    - name: dataset_id
+      description: "HF dataset ID"
+    - name: output_repo
+      description: "HF repo to push trained model to"
+  optional:
+    - name: max_steps
+      default: "500"
+    - name: lora_r
+      default: "16"
+    - name: batch_size
+      default: "4"
+    - name: learning_rate
+      default: "2e-4"
+    - name: max_seq_length
+      default: "2048"
+    - name: dataset_split
+      default: "train"
+    - name: text_column
+      default: "text"
+      description: "Dataset column with training text"
+script: |
+  import os
+  import torch
+  from datasets import load_dataset
+  from huggingface_hub import login
+  from peft import LoraConfig, TaskType
+  from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+  from trl import SFTTrainer, SFTConfig
+
+  # ── Params ────────────────────────────────────────────────────────────────
+  MODEL_ID = "{{model_id}}"
+  DATASET_ID = "{{dataset_id}}"
+  OUTPUT_REPO = "{{output_repo}}"
+  MAX_STEPS = int("{{max_steps}}")
+  LORA_R = int("{{lora_r}}")
+  BATCH_SIZE = int("{{batch_size}}")
+  LEARNING_RATE = float("{{learning_rate}}")
+  MAX_SEQ_LENGTH = int("{{max_seq_length}}")
+  DATASET_SPLIT = "{{dataset_split}}"
+  TEXT_COLUMN = "{{text_column}}"
+
+  hf_token = os.environ.get("HF_TOKEN", "")
+  if hf_token:
+      login(token=hf_token)
+
+  # ── Load model ─────────────────────────────────────────────────────────────
+  print(f"Loading model: {MODEL_ID}")
+  bnb_config = BitsAndBytesConfig(
+      load_in_4bit=True,
+      bnb_4bit_quant_type="nf4",
+      bnb_4bit_compute_dtype=torch.bfloat16,
+      bnb_4bit_use_double_quant=True,
+  )
+  model = AutoModelForCausalLM.from_pretrained(
+      MODEL_ID,
+      quantization_config=bnb_config,
+      device_map="auto",
+  )
+  tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+  if tokenizer.pad_token is None:
+      tokenizer.pad_token = tokenizer.eos_token
+
+  peft_config = LoraConfig(
+      task_type=TaskType.CAUSAL_LM,
+      r=LORA_R,
+      lora_alpha=LORA_R * 2,
+      lora_dropout=0.05,
+      target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                      "gate_proj", "up_proj", "down_proj"],
+  )
+
+  # ── Load dataset ──────────────────────────────────────────────────────────
+  print(f"Loading dataset: {DATASET_ID}")
+  dataset = load_dataset(DATASET_ID, split=DATASET_SPLIT)
+
+  # ── Train ─────────────────────────────────────────────────────────────────
+  trainer = SFTTrainer(
+      model=model,
+      tokenizer=tokenizer,
+      train_dataset=dataset,
+      peft_config=peft_config,
+      args=SFTConfig(
+          dataset_text_field=TEXT_COLUMN,
+          max_seq_length=MAX_SEQ_LENGTH,
+          per_device_train_batch_size=BATCH_SIZE,
+          gradient_accumulation_steps=4,
+          max_steps=MAX_STEPS,
+          learning_rate=LEARNING_RATE,
+          warmup_ratio=0.06,
+          weight_decay=0.01,
+          lr_scheduler_type="cosine",
+          bf16=True,
+          logging_steps=10,
+          logging_first_step=True,
+          disable_tqdm=True,
+          output_dir="/tmp/trl_checkpoints",
+          push_to_hub=True,
+          hub_model_id=OUTPUT_REPO,
+          hub_strategy="end",
+      ),
+  )
+
+  print(f"Training {MODEL_ID} for {MAX_STEPS} steps on {len(dataset)} examples")
+  trainer.train()
+  trainer.push_to_hub()
+  print(f"Done! Model pushed to: https://huggingface.co/{OUTPUT_REPO}")

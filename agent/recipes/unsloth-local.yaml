@@ -1,0 +1,127 @@
+name: unsloth-local
+framework: unsloth
+runtime: local
+description: >
+  SFT fine-tuning with Unsloth on a local CUDA GPU. 2-5x faster than standard
+  Transformers, 70% less VRAM. Best for 1B-7B models on a local machine with
+  a NVIDIA GPU (RTX 3090/4090, A100, etc.). No cloud cost.
+recommended_model_size_range: "1B–7B"
+dependencies:
+  - "unsloth[colab-new]"
+  - "trl>=0.8.6"
+  - "datasets"
+  - "huggingface_hub"
+params:
+  required:
+    - name: model_id
+      description: "HF model ID with unsloth/ prefix recommended (e.g. unsloth/Qwen2.5-1.5B-Instruct)"
+    - name: dataset_id
+      description: "HF dataset ID"
+    - name: output_repo
+      description: "HF repo to push trained model to"
+  optional:
+    - name: max_steps
+      default: "500"
+    - name: lora_r
+      default: "16"
+    - name: batch_size
+      default: "4"
+    - name: learning_rate
+      default: "2e-4"
+    - name: max_seq_length
+      default: "2048"
+    - name: dataset_split
+      default: "train"
+script: |
+  import os
+  from datasets import load_dataset
+  from huggingface_hub import login
+
+  # ── Params ────────────────────────────────────────────────────────────────
+  MODEL_ID = "{{model_id}}"
+  DATASET_ID = "{{dataset_id}}"
+  OUTPUT_REPO = "{{output_repo}}"
+  MAX_STEPS = int("{{max_steps}}")
+  LORA_R = int("{{lora_r}}")
+  BATCH_SIZE = int("{{batch_size}}")
+  LEARNING_RATE = float("{{learning_rate}}")
+  MAX_SEQ_LENGTH = int("{{max_seq_length}}")
+  DATASET_SPLIT = "{{dataset_split}}"
+
+  hf_token = os.environ.get("HF_TOKEN", "")
+  if hf_token:
+      login(token=hf_token)
+
+  # ── Load model with Unsloth ───────────────────────────────────────────────
+  from unsloth import FastLanguageModel
+  from unsloth.chat_templates import standardize_sharegpt
+
+  print(f"Loading model: {MODEL_ID}")
+  model, tokenizer = FastLanguageModel.from_pretrained(
+      model_name=MODEL_ID,
+      max_seq_length=MAX_SEQ_LENGTH,
+      dtype=None,
+      load_in_4bit=True,
+  )
+
+  LORA_TARGET_MODULES = [
+      "q_proj", "k_proj", "v_proj", "o_proj",
+      "gate_proj", "up_proj", "down_proj",
+  ]
+  model = FastLanguageModel.get_peft_model(
+      model,
+      r=LORA_R,
+      target_modules=LORA_TARGET_MODULES,
+      lora_alpha=LORA_R,
+      lora_dropout=0.0,
+      bias="none",
+      use_gradient_checkpointing="unsloth",
+      random_state=42,
+  )
+
+  # ── Load dataset ──────────────────────────────────────────────────────────
+  print(f"Loading dataset: {DATASET_ID}")
+  dataset = load_dataset(DATASET_ID, split=DATASET_SPLIT)
+  try:
+      dataset = standardize_sharegpt(dataset)
+      dataset = dataset.map(
+          lambda x: {"text": tokenizer.apply_chat_template(
+              x["conversations"], tokenize=False, add_generation_prompt=False
+          )},
+          batched=True,
+          remove_columns=dataset.column_names,
+      )
+  except Exception:
+      pass
+
+  # ── Train ─────────────────────────────────────────────────────────────────
+  from trl import SFTTrainer, SFTConfig
+
+  trainer = SFTTrainer(
+      model=model,
+      tokenizer=tokenizer,
+      train_dataset=dataset,
+      args=SFTConfig(
+          per_device_train_batch_size=BATCH_SIZE,
+          gradient_accumulation_steps=4,
+          max_steps=MAX_STEPS,
+          learning_rate=LEARNING_RATE,
+          warmup_ratio=0.06,
+          weight_decay=0.01,
+          lr_scheduler_type="cosine",
+          bf16=True,
+          optim="adamw_8bit",
+          logging_steps=10,
+          logging_first_step=True,
+          disable_tqdm=True,
+          output_dir="/tmp/unsloth_local_checkpoints",
+          push_to_hub=True,
+          hub_model_id=OUTPUT_REPO,
+          hub_strategy="end",
+      ),
+  )
+
+  print(f"Training {MODEL_ID} for {MAX_STEPS} steps on {len(dataset)} examples")
+  trainer.train()
+  trainer.push_to_hub()
+  print(f"Done! Model pushed to: https://huggingface.co/{OUTPUT_REPO}")
