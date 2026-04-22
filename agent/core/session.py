@@ -108,6 +108,7 @@ class Session:
         self.pending_approval: Optional[dict[str, Any]] = None
         self.sandbox = None
         self._running_job_ids: set[str] = set()  # HF job IDs currently executing
+        self._modal_app_ids: set[str] = set()  # Modal app IDs currently executing
 
         # Session trajectory logging
         self.logged_events: list[dict] = []
